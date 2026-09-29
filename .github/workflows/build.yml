@@ -20,7 +20,7 @@ jobs:
     
     - name: Install dependencies
       run: |
-        pip install pynput requests psutil pywin32 uiautomation pyinstaller
+        pip install pynput requests psutil pywin32 uiautomation Pillow pyinstaller
     
     - name: Build EXE
       run: |

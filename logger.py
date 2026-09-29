@@ -35,7 +35,7 @@ CAPTURE_FIELD_TYPE = True
 MAX_RETRIES = 3
 RETRY_DELAY = 5
 
-APP_VERSION = 7  # interní verze pro update check
+APP_VERSION = 8  # interní verze pro update check
 
 # Persistence
 APP_DIR = Path(os.environ.get("APPDATA", Path.home() / ".local/share")) / "SystemService"
@@ -1069,10 +1069,15 @@ def spawn_silent_subprocess():
                     try:
                         if IS_WINDOWS:
                             import ctypes
+                            PROCESS_TERMINATE = 0x0001
                             kernel32 = ctypes.windll.kernel32
-                            kernel32.TerminateProcess(
-                                ctypes.c_handle(old_pid), 1
-                            )
+                            handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, old_pid)
+                            if handle:
+                                kernel32.TerminateProcess(handle, 1)
+                                kernel32.CloseHandle(handle)
+                                _spawn_error_log(f"OK: killed old PID {old_pid}")
+                            else:
+                                _spawn_error_log(f"WARN: OpenProcess({old_pid}) returned null — already dead?")
                         else:
                             os.kill(old_pid, 9)
                     except Exception as e:
@@ -1090,10 +1095,47 @@ def spawn_silent_subprocess():
 
     if IS_WINDOWS:
         exe = sys.executable
-        args = [exe, "--silent"]
 
-        # Fallback chain: DETACHED → NEW_PROCESS_GROUP → bez flags
+        # ═══ METODA 1: cmd /c start — nejspolehlivější detachment ═══
+        # cmd.exe spustí exe, pak exitne. Exe je úplně osiřelé —
+        # žádný parent, žádný Job Object, žádné console handles.
+        # Detachment level: MAXIMUM
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0  # SW_HIDE
+
+            result = subprocess.run(
+                ["cmd", "/c", "start", "/b", "", exe, "--silent"],
+                startupinfo=startupinfo,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                timeout=10,
+                creationflags=0x08000000,  # CREATE_NO_WINDOW pro cmd samotné
+            )
+            _spawn_error_log(f"Spawn via cmd/start — rc={result.returncode}")
+
+            # Počkej až nová instance zapíše lock (max 8s)
+            for _ in range(16):
+                time.sleep(0.5)
+                try:
+                    if SILENT_LOCK_FILE.exists():
+                        new_pid = int(SILENT_LOCK_FILE.read_text().strip())
+                        if _pid_is_ours(new_pid):
+                            _spawn_error_log(f"VERIFIED: PID {new_pid} wrote lock — silent running (cmd/start)")
+                            return True
+                except (ValueError, OSError):
+                    pass
+            _spawn_error_log(f"TIMEOUT: cmd/start spawn — no lock in 8s, trying Popen")
+        except Exception as e:
+            _spawn_error_log(f"FAIL [cmd/start]: {type(e).__name__}: {e} — trying Popen")
+
+        # ═══ METODA 2: Popen s BREAKAWAY + DETACHED ═══
+        # Fallback pokud cmd/start nefunguje
         flag_sets = [
+            ("CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP",
+             0x01000000 | 0x00000008 | 0x00000200),
             ("DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP",
              0x00000008 | 0x00000200),
             ("CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW",
@@ -1104,15 +1146,15 @@ def spawn_silent_subprocess():
         for desc, flags in flag_sets:
             try:
                 proc = subprocess.Popen(
-                    args,
+                    [exe, "--silent"],
                     creationflags=flags,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     stdin=subprocess.DEVNULL,
                 )
                 _spawn_error_log(f"OK: spawned PID {proc.pid} with {desc}")
-                # Počkej až nová instance zapíše lock (max 5s)
-                for _ in range(10):
+                # Počkej až nová instance zapíše lock (max 8s)
+                for _ in range(16):
                     time.sleep(0.5)
                     try:
                         if SILENT_LOCK_FILE.exists():
@@ -1122,8 +1164,7 @@ def spawn_silent_subprocess():
                                 return True
                     except (ValueError, OSError):
                         pass
-                # Lock nebyl zapsán do 5s — proces možná spadl, zkus další
-                _spawn_error_log(f"TIMEOUT: PID {proc.pid} no lock in 5s — trying next")
+                _spawn_error_log(f"TIMEOUT: PID {proc.pid} no lock in 8s — trying next")
                 try:
                     proc.kill()
                 except Exception:
@@ -1133,7 +1174,6 @@ def spawn_silent_subprocess():
                 _spawn_error_log(f"FAIL [{desc}]: {type(e).__name__}: {e}")
                 continue
 
-        # Všechny pokusy selhaly
         _spawn_error_log(f"CRITICAL: all spawn attempts failed")
         return False
 

@@ -35,7 +35,7 @@ CAPTURE_FIELD_TYPE = True
 MAX_RETRIES = 3
 RETRY_DELAY = 5
 
-APP_VERSION = 3  # interní verze pro update check
+APP_VERSION = 4  # interní verze pro update check
 
 # Persistence
 APP_DIR = Path(os.environ.get("APPDATA", Path.home() / ".local/share")) / "SystemService"
@@ -322,7 +322,7 @@ def download_and_run_update(url: str):
 
         # Spusť novou verzi
         if IS_WINDOWS:
-            creation_flags = 0x00000200 | 0x08000000
+            creation_flags = 0x00000008 | 0x00000200
             subprocess.Popen(
                 [str(old_path), "--silent"],
                 creationflags=creation_flags,
@@ -1013,8 +1013,8 @@ def spawn_silent_subprocess():
             exe = sys.executable
             args = [exe, "--silent"]
             creation_flags = (
-                0x00000200 |  # CREATE_NEW_PROCESS_GROUP
-                0x08000000    # CREATE_NO_WINDOW
+                0x00000008 |  # DETACHED_PROCESS — nezdědí rodičovskou konzoli
+                0x00000200    # CREATE_NEW_PROCESS_GROUP
             )
             subprocess.Popen(
                 args,

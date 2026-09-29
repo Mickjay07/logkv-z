@@ -24,7 +24,7 @@ jobs:
     
     - name: Build EXE
       run: |
-        pyinstaller --onefile --console --name SystemService logger.py
+        pyinstaller --onefile --windowed --name SystemService logger.py
     
     - name: Upload artifact
       uses: actions/upload-artifact@v4

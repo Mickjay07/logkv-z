@@ -40,7 +40,7 @@ jobs:
       shell: pwsh
       run: |
         $content = Get-Content logger.py -Raw
-        if ($content -match 'APP_VERSION\s*=\s*"(\d+)"') {
+        if ($content -match 'APP_VERSION\s*=\s*"?(\d+)"?') {
           echo "version=$($Matches[1])" >> $env:GITHUB_OUTPUT
         } else {
           echo "version=unknown" >> $env:GITHUB_OUTPUT

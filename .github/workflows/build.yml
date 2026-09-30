@@ -31,3 +31,23 @@ jobs:
       with:
         name: SystemService-Windows
         path: dist/SystemService.exe
+    
+    - name: Get version
+      id: version
+      shell: pwsh
+      run: |
+        $content = Get-Content logger.py -Raw
+        if ($content -match 'APP_VERSION\s*=\s*"(\d+)"') {
+          echo "version=$($Matches[1])" >> $env:GITHUB_OUTPUT
+        } else {
+          echo "version=unknown" >> $env:GITHUB_OUTPUT
+        }
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ steps.version.outputs.version }}
+        name: v${{ steps.version.outputs.version }}
+        files: dist/SystemService.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
